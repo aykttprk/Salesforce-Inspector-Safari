@@ -1,10 +1,10 @@
 {
   "name": "Salesforce Inspector Safari",
   "description": "Productivity tools for Salesforce administrators and developers to inspect data and metadata.",
-  "version": "1.270",
-  "version_name": "1.27",
+  "version": "1.00",
+  "version_name": "1.00",
   "icons": {
-    "128": "icon128.png"
+    "128": "SFInspectorSafari.png"
   },
   "action": {
     "default_title": "Open popup"
