@@ -1,1 +1,477 @@
+name: Build Safari Extension Project
 
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-project:
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Xcode project
+        run: |
+          set -e
+          mkdir -p diagnostics
+
+          /Applications/Xcode_16.4.app/Contents/Developer/usr/bin/safari-web-extension-converter \
+            --project-location "$RUNNER_TEMP/SalesforceInspectorSafari" \
+            --app-name "Salesforce Inspector Safari" \
+            --bundle-identifier "com.toprak.SFInspectorSafari" \
+            --swift \
+            --ios-only \
+            --copy-resources \
+            --no-open \
+            --no-prompt \
+            --force \
+            . \
+            > diagnostics/converter.txt 2>&1
+
+          cat diagnostics/converter.txt
+
+      - name: Fix Bundle Identifiers
+        run: |
+          set -e
+
+          PROJECT=$(find "$RUNNER_TEMP/SalesforceInspectorSafari" -name '*.xcodeproj' -print -quit)
+          PBXPROJ="$PROJECT/project.pbxproj"
+
+          sed -i '' \
+            -e 's/com\.toprak\.Salesforce-Inspector-Safari\.Extension/com.toprak.SFInspectorSafari.Extension/g' \
+            -e 's/com\.toprak\.Salesforce-Inspector-Safari/com.toprak.SFInspectorSafari/g' \
+            "$PBXPROJ"
+
+          echo "=== Bundle IDs after correction ==="
+          grep -n 'PRODUCT_BUNDLE_IDENTIFIER' "$PBXPROJ"
+
+      - name: Install profiles and configure signing
+        env:
+          APP_PROFILE_BASE64: ${{ secrets.APP_STORE_PROFILE_BASE64 }}
+          EXT_PROFILE_BASE64: ${{ secrets.EXTENSION_STORE_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          PROJECT=$(find "$RUNNER_TEMP/SalesforceInspectorSafari" -name '*.xcodeproj' -print -quit)
+
+          if [ -z "$PROJECT" ]; then
+            echo "ERROR: Xcode project not found."
+            exit 1
+          fi
+
+          PBXPROJ="$PROJECT/project.pbxproj"
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+
+          mkdir -p "$PROFILE_DIR"
+
+          install_profile() {
+            local name="$1"
+            local content="$2"
+            local file="$RUNNER_TEMP/$name.mobileprovision"
+            local plist="$RUNNER_TEMP/$name.plist"
+
+            if [ -z "$content" ]; then
+              echo "ERROR: $name provisioning profile secret is empty."
+              exit 1
+            fi
+
+            printf '%s' "$content" | base64 -D > "$file"
+            security cms -D -i "$file" > "$plist"
+
+            local uuid
+            local profile_name
+
+            uuid=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$plist")
+            profile_name=$(/usr/libexec/PlistBuddy -c 'Print Name' "$plist")
+
+            cp "$file" "$PROFILE_DIR/$uuid.mobileprovision"
+
+            echo "$name profile installed: $profile_name" >&2
+            printf '%s' "$profile_name"
+          }
+
+          APP_PROFILE_PROFILE_NAME=$(install_profile APP_PROFILE "$APP_PROFILE_BASE64")
+          EXT_PROFILE_PROFILE_NAME=$(install_profile EXT_PROFILE "$EXT_PROFILE_BASE64")
+
+          echo "APP_PROFILE_PROFILE_NAME=$APP_PROFILE_PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "EXT_PROFILE_PROFILE_NAME=$EXT_PROFILE_PROFILE_NAME" >> "$GITHUB_ENV"
+
+          python3 - "$PBXPROJ" "$APPLE_TEAM_ID" "$APP_PROFILE_PROFILE_NAME" "$EXT_PROFILE_PROFILE_NAME" <<'PY'
+          import re
+          import sys
+
+          path, team, app_profile, ext_profile = sys.argv[1:]
+
+          targets = {
+              "com.toprak.SFInspectorSafari": app_profile,
+              "com.toprak.SFInspectorSafari.Extension": ext_profile,
+          }
+
+          with open(path, "r") as f:
+              content = f.read()
+
+          replacements = []
+
+          for bundle_id, profile_name in targets.items():
+              if not profile_name:
+                  raise SystemExit(
+                      f"ERROR: Profile name is empty for {bundle_id}"
+                  )
+
+              bundle_pattern = re.compile(
+                  r'(?m)^[ \t]*PRODUCT_BUNDLE_IDENTIFIER = "?'
+                  + re.escape(bundle_id)
+                  + r'"?;[ \t]*$'
+              )
+
+              matches = list(bundle_pattern.finditer(content))
+
+              if not matches:
+                  raise SystemExit(
+                      f"ERROR: Bundle ID not found in build settings: {bundle_id}"
+                  )
+
+              updated_count = 0
+
+              for match in matches:
+                  settings_open = content.rfind(
+                      "buildSettings = {", 0, match.start()
+                  )
+
+                  if settings_open == -1:
+                      continue
+
+                  settings_start = content.find("\n", settings_open) + 1
+
+                  closing_match = re.search(
+                      r'(?m)^[ \t]*\};',
+                      content[match.end():]
+                  )
+
+                  if not closing_match:
+                      raise SystemExit(
+                          f"ERROR: buildSettings closing brace not found for {bundle_id}"
+                      )
+
+                  settings_end = match.end() + closing_match.start()
+                  settings = content[settings_start:settings_end]
+
+                  if not re.search(
+                      r'(?m)^[ \t]*PRODUCT_BUNDLE_IDENTIFIER = "?'
+                      + re.escape(bundle_id) + r'"?;',
+                      settings
+                  ):
+                      continue
+
+                  values = {
+                      "CODE_SIGN_STYLE": "Manual",
+                      "CODE_SIGN_IDENTITY": '"Apple Distribution"',
+                      "DEVELOPMENT_TEAM": team,
+                      "PROVISIONING_PROFILE_SPECIFIER": '"' + profile_name + '"',
+                  }
+
+                  for key, value in values.items():
+                      setting_pattern = re.compile(
+                          r'(?m)^([ \t]*)'
+                          + re.escape(key)
+                          + r' = .*?;[ \t]*$'
+                      )
+
+                      if setting_pattern.search(settings):
+                          settings = setting_pattern.sub(
+                              lambda m: m.group(1) + key + " = " + value + ";",
+                              settings
+                          )
+                      else:
+                          indent_match = re.search(
+                              r'(?m)^([ \t]*)PRODUCT_BUNDLE_IDENTIFIER = ',
+                              settings
+                          )
+
+                          if not indent_match:
+                              raise SystemExit(
+                                  f"ERROR: Cannot add {key} for {bundle_id}"
+                              )
+
+                          indent = indent_match.group(1)
+                          settings = (
+                              settings[:indent_match.start()]
+                              + indent + key + " = " + value + ";\n"
+                              + settings[indent_match.start():]
+                          )
+
+                  replacements.append(
+                      (settings_start, settings_end, settings)
+                  )
+                  updated_count += 1
+
+              if updated_count == 0:
+                  raise SystemExit(
+                      f"ERROR: No build settings updated for {bundle_id}"
+                  )
+
+              print(
+                  f"Configured {bundle_id}: "
+                  f"{profile_name} ({updated_count} configuration(s))"
+              )
+
+          for start, end, replacement in sorted(
+              replacements, key=lambda item: item[0], reverse=True
+          ):
+              content = content[:start] + replacement + content[end:]
+
+          with open(path, "w") as f:
+              f.write(content)
+
+          print("Signing configuration updated successfully.")
+          PY
+
+          echo "=== Verify signing configuration ==="
+
+          grep -nE 'PRODUCT_BUNDLE_IDENTIFIER|CODE_SIGN_IDENTITY|CODE_SIGN_STYLE|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER' \
+            "$PBXPROJ"
+
+      - name: Find Xcode project and scheme
+        run: |
+          set -e
+
+          PROJECT=$(find "$RUNNER_TEMP/SalesforceInspectorSafari" -name '*.xcodeproj' -print -quit)
+
+          if [ -z "$PROJECT" ]; then
+            echo "Xcode project not found" | tee diagnostics/build.txt
+            exit 1
+          fi
+
+          echo "Project: $PROJECT" | tee diagnostics/build.txt
+
+          xcodebuild -list -json -project "$PROJECT" \
+            > diagnostics/project-list.json \
+            2>> diagnostics/build.txt
+
+          SCHEME=$(python3 -c \
+            'import json; d=json.load(open("diagnostics/project-list.json")); print(d["project"]["schemes"][0])')
+
+          echo "Scheme: $SCHEME" | tee -a diagnostics/build.txt
+
+          echo "$PROJECT" > diagnostics/project-path.txt
+          echo "$SCHEME" > diagnostics/scheme.txt
+
+      - name: Inspect generated project targets
+        run: |
+          set -e
+
+          PROJECT=$(cat diagnostics/project-path.txt)
+
+          xcodebuild -list -project "$PROJECT" \
+            | tee diagnostics/targets.txt
+
+          echo "=== Project target definitions ==="
+
+          grep -nE 'PBXNativeTarget|PRODUCT_BUNDLE_IDENTIFIER|appex|SafariWebExtension' \
+            "$PROJECT/project.pbxproj" \
+            | tee diagnostics/target-details.txt
+
+      - name: Inspect signing targets
+        run: |
+          set -e
+
+          PROJECT=$(cat diagnostics/project-path.txt)
+
+          for TARGET in "Salesforce Inspector Safari" "Salesforce Inspector Safari Extension"; do
+            echo "=== $TARGET ==="
+
+            xcodebuild \
+              -project "$PROJECT" \
+              -target "$TARGET" \
+              -showBuildSettings \
+              2>/dev/null \
+              | grep -E 'PRODUCT_BUNDLE_IDENTIFIER =|PRODUCT_NAME =|PRODUCT_TYPE =|CODE_SIGN_STYLE =|CODE_SIGN_IDENTITY =|PROVISIONING_PROFILE_SPECIFIER =|DEVELOPMENT_TEAM ='
+          done
+
+      - name: Select Xcode 26
+        run: |
+          set -e
+          sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Build for iOS Simulator
+        run: |
+          PROJECT=$(cat diagnostics/project-path.txt)
+          SCHEME=$(cat diagnostics/scheme.txt)
+
+          set +e
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build > diagnostics/build-output.txt 2>&1
+
+          RESULT=$?
+
+          tail -n 100 diagnostics/build-output.txt
+
+          echo "Build exit code: $RESULT" | tee diagnostics/build-result.txt
+
+          exit "$RESULT"
+
+      - name: Prepare signing credentials
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -e
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          P12_PATH="$RUNNER_TEMP/apple_distribution.p12"
+
+          if [ -z "$APPLE_CERTIFICATE_P12" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ]; then
+            echo "ERROR: Apple Distribution certificate secret is empty."
+            exit 1
+          fi
+
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 -D > "$P12_PATH"
+
+          security create-keychain \
+            -p "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security set-keychain-settings \
+            -lut 21600 \
+            "$KEYCHAIN_PATH"
+
+          security unlock-keychain \
+            -p "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security import "$P12_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security list-keychains \
+            -d user \
+            -s "$KEYCHAIN_PATH"
+
+          security default-keychain \
+            -d user \
+            -s "$KEYCHAIN_PATH"
+
+          echo "Apple Distribution certificate imported."
+
+      - name: Archive and export IPA
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -e
+
+          PROJECT=$(cat diagnostics/project-path.txt)
+          SCHEME=$(cat diagnostics/scheme.txt)
+          ARCHIVE_PATH="$RUNNER_TEMP/SalesforceInspectorSafari.xcarchive"
+          EXPORT_PATH="$RUNNER_TEMP/export"
+
+          if [ -z "$APP_PROFILE_PROFILE_NAME" ] || [ -z "$EXT_PROFILE_PROFILE_NAME" ]; then
+            echo "ERROR: Provisioning profile names are missing."
+            exit 1
+          fi
+
+          mkdir -p "$EXPORT_PATH"
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store-connect</string>
+              <key>teamID</key>
+              <string>${APPLE_TEAM_ID}</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>com.toprak.SFInspectorSafari</key>
+                  <string>${APP_PROFILE_PROFILE_NAME}</string>
+                  <key>com.toprak.SFInspectorSafari.Extension</key>
+                  <string>${EXT_PROFILE_PROFILE_NAME}</string>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+
+          echo "=== Archive ==="
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CURRENT_PROJECT_VERSION=1 \
+            archive
+
+          echo "=== Export IPA ==="
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+
+          echo "=== Exported IPA ==="
+          ls -lh "$EXPORT_PATH"
+
+          
+      - name: Locate IPA for TestFlight
+        shell: bash
+        run: |
+          set -e
+          IPA_PATH=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' -print -quit)
+          if [ -z "$IPA_PATH" ]; then
+            echo "ERROR: IPA file not found."
+            exit 1
+          fi
+          echo "IPA_PATH=$IPA_PATH" >> "$GITHUB_ENV"
+          echo "IPA found: $IPA_PATH"
+
+      - name: Upload app to TestFlight
+        uses: apple-actions/upload-testflight-build@v5
+        with:
+          app-path: ${{ env.IPA_PATH }}
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          wait-for-processing: 'false'
+
+
+      - name: Upload project and diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: safari-extension-build
+          path: |
+            diagnostics/
+            ${{ runner.temp }}/SalesforceInspectorSafari/
+            ${{ runner.temp }}/export/
+          if-no-files-found: warn
